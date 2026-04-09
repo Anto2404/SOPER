@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#define _XOPEN_SOURCE 500
 #include <fcntl.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -12,96 +13,92 @@
 #include <pthread.h>
 #include "pow.h"
 #include <errno.h>
-#define _POSIX_C_SOURCE 200809L
-/* ────────────────────────────────────────────────────────────
-   FICHEROS Y SEMÁFOROS DEL SISTEMA
-   ──────────────────────────────────────────────────────────── */
-#define FILE_PIDS "pids.pid"
-#define FILE_TARGET "target.tgt"
-#define FILE_VOTES "voting.vot"
 
-#define SEM_PIDS "/sem_pids"
-#define SEM_TARGET "/sem_target"
-#define SEM_VOTES "/sem_votes"
-#define SEM_WINNER "/sem_winner"
+/*Ficheros del sistema*/
+#define FILE_PIDS "pids.pid"     /**< Lista de PIDs de mineros activos */
+#define FILE_TARGET "target.tgt" /**< Objetivo actual de la ronda (target) */
+#define FILE_VOTES "voting.vot"  /**< Urna de votos de la ronda actual */
+#define FILE_ROUND "round.rnd"   /**< Contador global de rondas */
 
-/* ────────────────────────────────────────────────────────────
-   VARIABLES GLOBALES
-   ──────────────────────────────────────────────────────────── */
+/*Semaforos*/
+#define SEM_PIDS "/sem_pids"     /**< Mutex para FILE_PIDS */
+#define SEM_TARGET "/sem_target" /**< Mutex para FILE_TARGET y FILE_ROUND */
+#define SEM_VOTES "/sem_votes"   /**< Mutex para FILE_VOTES */
+#define SEM_WINNER "/sem_winner" /**< Semáforo de competición: vale 1 al inicio de cada ronda; el primer proceso que hace sem_trywait con éxito se proclama ganador */
+
+/** PID del proceso actual */
 static pid_t my_pid;
+/** Número de hilos de minado configurado por parámetro */
 static int n_threads;
 
-/* Semáforos globales para que el handler los pueda usar */
+
 static sem_t *sem_pids = NULL;
 static sem_t *sem_target = NULL;
 static sem_t *sem_votes = NULL;
 static sem_t *sem_winner = NULL;
 
-/* Flags de señal — solo se escriben en handlers, se leen en main */
+/* Flags de señal  escritos en handlers, leídos en main */
 static volatile sig_atomic_t flag_start_round = 0;
 static volatile sig_atomic_t flag_start_voting = 0;
 static volatile sig_atomic_t flag_timeout = 0;
 
+
+
 /* Estado de la ronda */
-static volatile sig_atomic_t have_winner = 0; /* hay ganador en esta ronda */
-static pid_t winner_pid = -1;
-static int i_am_winner = 0;
-static int my_coins = 0;
-static int round_id = 0;
+static volatile sig_atomic_t have_winner = 0; /**indica a los hilos de minado que ya hay ganador y deben parar.*/
+static int i_am_winner = 0;/** Este proceso ganó la ronda actual */
+static int my_coins = 0;/**monedas acumuladas por este proceso */
+static int local_round = 0; /* rondas que ha participado este proceso */
+static pid_t winner_pid = -1; /**Pid del proceso ganador */
 
-/* ────────────────────────────────────────────────────────────
-   PROTOTIPOS
-   ──────────────────────────────────────────────────────────── */
-static void print_pids(void);
-static void remove_my_pid(void);
-static void cleanup_and_exit(int coins);
-
-/* ────────────────────────────────────────────────────────────
-   HANDLERS DE SEÑALES  (mínimos — solo ponen flags)
-   ──────────────────────────────────────────────────────────── */
-static void handler_SIGUSR1(int sig)
+/** Manejador de SIGUSR1: marca inicio de nueva ronda */
+static void manejador_SIGUSR1(int sig)
 {
     (void)sig;
     flag_start_round = 1;
 }
-static void handler_SIGUSR2(int sig)
+/** Manejador de SIGUSR2: marca inicio de fase de votación */
+static void manejador_SIGUSR2(int sig)
 {
     (void)sig;
-    flag_start_voting = 1; /*Comienza la fase de votacion*/
+    flag_start_voting = 1;
     have_winner = 1;
 }
-static void handler_SIGALRM(int sig)
+/** Manejador de Sigalarm: marca fin del tiempo de vida del proceso */
+static void manejador_SIGALRM(int sig)
 {
     (void)sig;
     flag_timeout = 1;
     have_winner = 1;
 }
 
-/* ────────────────────────────────────────────────────────────
-   INSTALACIÓN DE SEÑALES
-   ──────────────────────────────────────────────────────────── */
-static void setup_signals(void)
+/**
+ * @brief Instala los manejadores de señal para SIGUSR1, SIGUSR2 y SIGALRM.
+ *
+ * Termina el proceso con error si alguna instalación falla.
+ */
+static void instalar_senales(void)
 {
-    struct sigaction sa = {0};
-
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    /* Vaciamos la máscara (no bloqueamos ninguna señal extra al recibir esta) */
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-
-    sa.sa_handler = handler_SIGUSR1;
+/*Asignamos el manejador */
+    sa.sa_handler = manejador_SIGUSR1;
+    /*Registramos la señal en el nucleo*/
     if (sigaction(SIGUSR1, &sa, NULL) < 0)
     {
         perror("sigaction SIGUSR1");
         exit(EXIT_FAILURE);
     }
-
-    sa.sa_handler = handler_SIGUSR2;
+    sa.sa_handler = manejador_SIGUSR2;
     if (sigaction(SIGUSR2, &sa, NULL) < 0)
     {
         perror("sigaction SIGUSR2");
         exit(EXIT_FAILURE);
     }
-
-    sa.sa_handler = handler_SIGALRM;
+    sa.sa_handler = manejador_SIGALRM;
     if (sigaction(SIGALRM, &sa, NULL) < 0)
     {
         perror("sigaction SIGALRM");
@@ -109,38 +106,40 @@ static void setup_signals(void)
     }
 }
 
-static void open_semaphores(void)
-{
+/**
+ * @brief Abre (o crea si no existen) los semáforos POSIX del sistema.
+ *
+ * Todos los semáforos se crean con valor inicial 1 (mutex).
+ * sem_winner también empieza en 1: el primero en hacer sem_trywait gana.
+ * Termina el proceso con error si algún semáforo no puede abrirse.
+ */
 
+static void abrir_semaforos(void)
+{
     sem_pids = sem_open(SEM_PIDS, O_CREAT, 0644, 1);
     sem_target = sem_open(SEM_TARGET, O_CREAT, 0644, 1);
     sem_votes = sem_open(SEM_VOTES, O_CREAT, 0644, 1);
-    /* sem_winner valor inicial 1 (para que el primero lo coja) */
     sem_winner = sem_open(SEM_WINNER, O_CREAT, 0644, 1);
 
-    if (sem_pids == SEM_FAILED ||
-        sem_target == SEM_FAILED ||
-        sem_votes == SEM_FAILED ||
-        sem_winner == SEM_FAILED)
+    if (sem_pids == SEM_FAILED || sem_target == SEM_FAILED ||
+        sem_votes == SEM_FAILED || sem_winner == SEM_FAILED)
     {
         perror("sem_open");
         exit(EXIT_FAILURE);
     }
 }
-
-/* ────────────────────────────────────────────────────────────
-   GESTIÓN DEL FICHERO DE PIDS
-   ──────────────────────────────────────────────────────────── */
-
-/* Imprime todos los PIDs que hay en el fichero (llamar con sem cogido) */
-static void print_pids(void)
+/**
+ * @brief Imprime por pantalla los PIDs actuales en FILE_PIDS.
+ *
+ * Debe llamarse con sem_pids ya cogido para evitar condiciones de carrera.
+ */
+static void imprimir_pids(void)
 {
     FILE *f = fopen(FILE_PIDS, "r");
     if (!f)
         return;
-    int p;
+    int p, first = 1;
     printf("  Miners in system: [");
-    int first = 1;
     while (fscanf(f, "%d", &p) == 1)
     {
         if (!first)
@@ -153,8 +152,12 @@ static void print_pids(void)
     fclose(f);
 }
 
-/* Añade my_pid al fichero de PIDs */
-static void add_my_pid(void)
+/**
+ * @brief Añade el PID del proceso actual al fichero FILE_PIDS.
+ *
+ * Protegido por sem_pids. Imprime el estado del sistema tras la incorporación.
+ */
+static void add_mi_pid(void)
 {
     sem_wait(sem_pids);
     FILE *f = fopen(FILE_PIDS, "a");
@@ -164,16 +167,20 @@ static void add_my_pid(void)
         fclose(f);
     }
     printf("Miner %d added to system\n", my_pid);
-    print_pids();
+    imprimir_pids();
     sem_post(sem_pids);
 }
 
-/* Elimina my_pid del fichero; si es el último borra el fichero */
-static void remove_my_pid(void)
+/**
+ * @brief Elimina el PID del proceso actual del fichero FILE_PIDS.
+ *
+ * Si es el último minero, elimina todos los ficheros del sistema y
+ * hace sem_unlink de todos los semáforos para liberar los recursos del sistema.
+ * Protegido por sem_pids.
+ */
+static void eliminar_mi_pid(void)
 {
     sem_wait(sem_pids);
-
-    /* Leer todos los PIDs excepto el nuestro */
     FILE *f = fopen(FILE_PIDS, "r");
     int pids[1024], n = 0;
     if (f)
@@ -184,13 +191,13 @@ static void remove_my_pid(void)
                 pids[n++] = p;
         fclose(f);
     }
-
     if (n == 0)
     {
-        /* Somos el último → borramos ficheros y semáforos del sistema */
+         /* Último minero: limpiar todo el sistema */
         unlink(FILE_PIDS);
         unlink(FILE_TARGET);
         unlink(FILE_VOTES);
+        unlink(FILE_ROUND);
         sem_unlink(SEM_PIDS);
         sem_unlink(SEM_TARGET);
         sem_unlink(SEM_VOTES);
@@ -199,7 +206,7 @@ static void remove_my_pid(void)
     }
     else
     {
-        /* Reescribimos el fichero sin nuestro PID */
+          /* Reescribir el fichero sin el PID propio */
         FILE *t = fopen(FILE_PIDS, "w");
         if (t)
         {
@@ -208,14 +215,18 @@ static void remove_my_pid(void)
             fclose(t);
         }
         printf("Miner %d exited system\n", my_pid);
-        print_pids();
+        imprimir_pids();
     }
-
     sem_post(sem_pids);
 }
-
-/* Lee todos los PIDs en un array; devuelve el número de PIDs leídos */
-static int read_pids(pid_t *buf, int max)
+/**
+ * @brief Lee los PIDs activos del fichero FILE_PIDS.
+ *
+ * @param buf Array donde se almacenarán los PIDs leídos.
+ * @param max Tamaño máximo del array buf.
+ * @return Número de PIDs leídos.
+ */
+static int leer_pids(pid_t *buf, int max)
 {
     int n = 0;
     sem_wait(sem_pids);
@@ -230,11 +241,12 @@ static int read_pids(pid_t *buf, int max)
     sem_post(sem_pids);
     return n;
 }
-
-/* ────────────────────────────────────────────────────────────
-   GESTIÓN DEL TARGET
-   ──────────────────────────────────────────────────────────── */
-static long int read_target(void)
+/**
+ * @brief Lee el target actual del fichero FILE_TARGET.
+ *
+ * @return Valor del target leído, o 0 si el fichero no existe.
+ */
+static long int leer_target(void)
 {
     long int t = 0;
     sem_wait(sem_target);
@@ -247,8 +259,12 @@ static long int read_target(void)
     sem_post(sem_target);
     return t;
 }
-
-static void write_target(long int t)
+/**
+ * @brief Escribe un nuevo valor de target en FILE_TARGET.
+ *
+ * @param t Nuevo valor del target a escribir.
+ */
+static void escribir_target(long int t)
 {
     sem_wait(sem_target);
     FILE *f = fopen(FILE_TARGET, "w");
@@ -260,11 +276,50 @@ static void write_target(long int t)
     sem_post(sem_target);
 }
 
-/* ────────────────────────────────────────────────────────────
-   FICHERO DE REGISTRO PERSONAL  <pid>.txt
-   ──────────────────────────────────────────────────────────── */
-static void log_round(int id, long int target, long int solution,
-                      const char *votes_str, int yes, int total)
+/**
+ * @brief Incrementa y devuelve el contador global de rondas.
+ *
+ * Solo el ganador de cada ronda llama a esta función.
+ * Protegido por sem_target .
+ *
+ * @return Número de ronda global tras el incremento.
+ */
+static int incrementar_ronda_global(void)
+{
+    int r = 0;
+    sem_wait(sem_target);
+    FILE *f = fopen(FILE_ROUND, "r");
+    if (f)
+    {
+        fscanf(f, "%d", &r);
+        fclose(f);
+    }
+    r++;
+    f = fopen(FILE_ROUND, "w");
+    if (f)
+    {
+        fprintf(f, "%d\n", r);
+        fclose(f);
+    }
+    sem_post(sem_target);
+    return r;
+}
+
+ 
+/**
+ * @brief Registra una ronda ganada en el fichero personal <pid>.txt.
+ *
+ * Solo se llama cuando la ronda es aceptada, cuando los demas la rechazan no. El fichero acumula
+ * todas las rondas ganadas por este proceso con su estado final.
+ *
+ * @param id        Número de ronda global.
+ * @param target    Objetivo que había que resolver.
+ * @param solution  Solución encontrada por este proceso.
+ * @param votes_str Cadena con los votos recibidos .
+ * @param yes       Número de votos yes.
+ * @param total     Total de votos recibidos.
+ */
+static void registrar_ronda(int id, long int target, long int solution, const char *votes_str, int yes, int total)
 {
     char fname[32];
     snprintf(fname, sizeof(fname), "%d.txt", my_pid);
@@ -280,55 +335,27 @@ static void log_round(int id, long int target, long int solution,
     fclose(f);
     (void)votes_str;
 }
+/**
+ * @brief Espera no activa a una señal usando sigsuspend.
+ *
+ * @param flag   Puntero al flag que la señal pone a 1.
+ * @param signum Número de la señal que se espera.
+ */
 
-/* ────────────────────────────────────────────────────────────
-   ESPERA NO ACTIVA CON sigsuspend
-   Desbloquea solo la señal indicada y espera.
-   ──────────────────────────────────────────────────────────── */
-static void wait_for_SIGUSR1(void)
+static void esperar_signal(volatile sig_atomic_t *flag, int signum)
 {
-    sigset_t mask, oldmask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGUSR1);
+    sigset_t block_mask, oldmask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, signum);
 
-    /* Bloqueamos SIGUSR1 ANTES de comprobar el flag */
-    if (sigprocmask(SIG_BLOCK, &mask, &oldmask) == -1)
+    /* Bloquear la señal antes de comprobar el flag para evitar que llegue entre la comprobación y el sigsuspend */
+    if (sigprocmask(SIG_BLOCK, &block_mask, &oldmask) == -1)
     {
         perror("sigprocmask");
         exit(EXIT_FAILURE);
     }
 
-    while (!flag_start_round)
-    {
-        /* sigsuspend restaura oldmask atómicamente → SIGUSR1 desbloqueada */
-        if (sigsuspend(&oldmask) == -1 && errno != EINTR)
-        {
-            perror("sigsuspend");
-            exit(EXIT_FAILURE);
-        }
-    }
-    flag_start_round = 0;
-
-    if (sigprocmask(SIG_SETMASK, &oldmask, NULL) == -1)
-    {
-        perror("sigprocmask");
-        exit(EXIT_FAILURE);
-    }
-}
-
-static void wait_for_SIGUSR2(void)
-{
-    sigset_t mask, oldmask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGUSR2);
-
-    if (sigprocmask(SIG_BLOCK, &mask, &oldmask) == -1)
-    {
-        perror("sigprocmask");
-        exit(EXIT_FAILURE);
-    }
-
-    while (!flag_start_voting)
+    while (!(*flag) && !flag_timeout)
     {
         if (sigsuspend(&oldmask) == -1 && errno != EINTR)
         {
@@ -336,56 +363,76 @@ static void wait_for_SIGUSR2(void)
             exit(EXIT_FAILURE);
         }
     }
-    flag_start_voting = 0;
-
+    *flag = 0;
+ /* Restaurar la máscara original */
     if (sigprocmask(SIG_SETMASK, &oldmask, NULL) == -1)
     {
         perror("sigprocmask");
         exit(EXIT_FAILURE);
     }
 }
-
-/* ────────────────────────────────────────────────────────────
-   MINADO — estructura compartida entre hilos
-   ──────────────────────────────────────────────────────────── */
+/**
+ * @brief Estructura de argumentos para cada hilo de minado.
+ *
+ * Cada hilo busca la solución en el rango [start, end).
+ * Si la encuentra e intenta proclamarse ganador mediante sem_trywait,
+ * escribe la solución en este struct.
+ */
 typedef struct
 {
-    long int start;    /* inicio del rango de búsqueda */
-    long int end;      /* fin del rango de búsqueda */
-    long int target;   /* objetivo: buscar x tal que pow_hash(x) == target */
-    long int solution; /* rellenado por el hilo que encuentra la solución */
-    int found;         /* 1 si este hilo encontró solución */
+    long int start;  /**< Inicio del rango de búsqueda */
+    long int end; /**< Fin del rango de búsqueda  */
+    long int target;  /**< Hash objetivo a encontrar */
+    long int solution; /**Solucion encontrada */
+    int found; /**< 1 si este hilo encontró la solución */
 } ThreadArg;
 
-static void *mine_thread(void *arg)
+/**
+ * @brief Función ejecutada por cada hilo de minado.
+ *
+ * Recorre el rango asignado buscando x tal que pow_hash(x) == target.
+ * Si lo encuentra, intenta proclamarse ganador con sem_trywait sobre
+ * sem_winner (. Si otro proceso ya ganó (sem_trywait
+ * falla), pone have_winner=1 para que los demás hilos paren.
+ *
+ * @param arg Puntero a ThreadArg con el rango y target asignados.
+ * @return NULL siempre.
+ */
+
+static void *minar_hilo(void *arg)
 {
     ThreadArg *a = (ThreadArg *)arg;
-
     for (long int x = a->start; x < a->end && !have_winner; x++)
     {
         if (pow_hash(x) == a->target)
         {
-            /* Intentamos ser el ganador de este proceso de forma atómica. Si encontramos la solucion del hash intentamos pill */
-            if (sem_trywait(sem_winner) == 0) /*Si semtrywait es 0 es que lo hemos pillado nosotros, */
+            if (sem_trywait(sem_winner) == 0)
             {
                 have_winner = 1;
-                winner_pid = my_pid; // Guarda quién ha ganado
                 i_am_winner = 1;
-                a->solution = x; // Guarda el número que es la solucion.
+                a->solution = x;
+                winner_pid = my_pid;
                 a->found = 1;
             }
-            /* Tanto si se nos declara ganador como si no, si no hemos podido entrar en el semaforo es que ya habia otro ganador */
+            else
+            {
+                have_winner = 1;
+            }
             break;
         }
     }
     return NULL;
 }
-
-/* ────────────────────────────────────────────────────────────
-   LANZAR HILOS DE MINADO
-   Devuelve la solución encontrada (0 si no fuimos el ganador)
-   ──────────────────────────────────────────────────────────── */
-static long int run_mining(long int target)
+/**
+ * @brief Lanza n_threads hilos de minado y espera a que terminen.
+ *
+ * Divide el espacio de búsqueda [0, POW_LIMIT) entre los hilos.
+ * Resetea have_winner y i_am_winner al inicio de cada llamada.
+ *
+ * @param target Hash objetivo que los hilos deben encontrar.
+ * @return La solución encontrada, o 0 si ningún hilo de este proceso ganó.
+ */
+static long int ejecutar_minado(long int target)
 {
     pthread_t *threads = malloc(n_threads * sizeof(pthread_t));
     ThreadArg *args = malloc(n_threads * sizeof(ThreadArg));
@@ -394,12 +441,10 @@ static long int run_mining(long int target)
         perror("malloc");
         exit(EXIT_FAILURE);
     }
-
+ /* Resetear estado de ganador para esta ronda */
     have_winner = 0;
     i_am_winner = 0;
-    winner_pid = -1;
 
-    /* Dividimos el espacio de búsqueda [0, POW_LIMIT) entre los hilos */
     long int range = POW_LIMIT / n_threads;
     for (int i = 0; i < n_threads; i++)
     {
@@ -408,7 +453,7 @@ static long int run_mining(long int target)
         args[i].target = target;
         args[i].solution = 0;
         args[i].found = 0;
-        pthread_create(&threads[i], NULL, mine_thread, &args[i]);
+        pthread_create(&threads[i], NULL, minar_hilo, &args[i]);
     }
 
     long int solution = 0;
@@ -423,38 +468,20 @@ static long int run_mining(long int target)
     free(args);
     return solution;
 }
+/**
+ * @brief Emite el voto de este proceso en FILE_VOTES.
+ *
+ * Comprueba si pow_hash(solution) == target. Si es correcto vota 'Y',
+ * si no vota 'N'. El ganador siempre llama con la solución real (Y),
+ * los demás con la propuesta del fichero (N si el ganador mintió).
+ *
+ * @param solution Solución a verificar.
+ * @param target   Target de la ronda actual.
+ */
 
-/* ────────────────────────────────────────────────────────────
-   ENVIAR SEÑAL A TODOS LOS MINEROS DEL FICHERO
-   ──────────────────────────────────────────────────────────── */
-static int broadcast_signal(int sig, pid_t *out_pids, int *out_n)
+static void emitir_voto(long int solution, long int target)
 {
-    pid_t pids[1024];
-    int n = read_pids(pids, 1024);
-    for (int i = 0; i < n; i++)
-    {
-        if (pids[i] != my_pid)
-            kill(pids[i], sig);
-    }
-    if (out_pids && out_n)
-    {
-        memcpy(out_pids, pids, n * sizeof(pid_t));
-        *out_n = n;
-    }
-    return n;
-}
-
-/* ────────────────────────────────────────────────────────────
-   VOTACIÓN
-   ──────────────────────────────────────────────────────────── */
-static int check_solution(long int solution, long int target)
-{
-    return pow_hash(solution) == target;
-}
-
-static void cast_vote(long int solution, long int target)
-{
-    char vote = check_solution(solution, target) ? 'Y' : 'N';
+    char vote = (pow_hash(solution) == target) ? 'Y' : 'N';
     sem_wait(sem_votes);
     FILE *f = fopen(FILE_VOTES, "a");
     if (f)
@@ -464,70 +491,73 @@ static void cast_vote(long int solution, long int target)
     }
     sem_post(sem_votes);
 }
-
-/* Lee los votos; devuelve total, y escribe yes/no */
-static int contar_votos(int *yes_out, int *no_out, char *cadena_votos, int max_cadena)
+/**
+ * @brief Lee y cuenta los votos del fichero FILE_VOTES.
+ *
+ * @param yes_out     Puntero donde se almacena el número de votos 'Y'.
+ * @param no_out      Puntero donde se almacena el número de votos 'N'.
+ * @param votes_str   Buffer donde se construye la cadena de votos (ej: "Y N Y ").
+ * @param max_str     Tamaño máximo del buffer votes_str.
+ * @return Total de votos leídos.
+ */
+static int contar_votos(int *yes_out, int *no_out, char *votes_str, int max_str)
 {
-    int si = 0, no = 0, total = 0;
-    cadena_votos[0] = '\0'; // Inicializamos la cadena vacía
-
-    // 1. Bloqueamos el semáforo para leer la "urna" sin que nadie escriba
+    int yes = 0, no = 0, total = 0;
+    votes_str[0] = '\0';
     sem_wait(sem_votes);
-
-    FILE *fichero = fopen(FILE_VOTES, "r");
-    if (fichero)
+    FILE *f = fopen(FILE_VOTES, "r");
+    if (f)
     {
-        int pid_leido;
-        char voto_leido;
-
-        // 2. Leemos el fichero: cada línea tiene "PID VOTO" (ej: 1234 Y)
-        while (fscanf(fichero, "%d %c\n", &pid_leido, &voto_leido) == 2)
+        int pid_read;
+        char v;
+        while (fscanf(f, "%d %c\n", &pid_read, &v) == 2)
         {
             total++;
-            if (voto_leido == 'Y')
-            {
-                si++;
-            }
+            if (v == 'Y')
+                yes++;
             else
-            {
                 no++;
-            }
-
-            /*  Vamos montando el texto que se imprimira en consola con el resumen de los votos */
-            char temporal[8];
-            snprintf(temporal, sizeof(temporal), "%c ", voto_leido);
-
-            // Concatenamos el voto a la cadena final sin pasarnos del tamaño
-            strncat(cadena_votos, temporal, max_cadena - strlen(cadena_votos) - 1);
+            char tmp[4];
+            snprintf(tmp, sizeof(tmp), "%c ", v);
+            strncat(votes_str, tmp, max_str - strlen(votes_str) - 1);
         }
-        fclose(fichero);
+        fclose(f);
     }
-
-   
     sem_post(sem_votes);
-    *yes_out = si;
+    *yes_out = yes;
     *no_out = no;
-
     return total;
 }
-
-/* ────────────────────────────────────────────────────────────
-   LIMPIEZA Y SALIDA
-   ──────────────────────────────────────────────────────────── */
-static void cleanup_and_exit(int coins)
+ 
+/**
+ * @brief Imprime las monedas finales y libera todos los recursos del proceso.
+ *
+ * Llama a eliminar_mi_pid() (que limpia ficheros si es el último),
+ * cierra los semáforos y termina el proceso.
+ */
+static void limpiar_y_salir(void)
 {
-    (void)coins;
-    remove_my_pid();
+    printf("Miner %d finished with %d coins\n", my_pid, my_coins);
+    fflush(stdout);
+    eliminar_mi_pid();
     sem_close(sem_pids);
     sem_close(sem_target);
     sem_close(sem_votes);
     sem_close(sem_winner);
     exit(EXIT_SUCCESS);
 }
-
-/* ────────────────────────────────────────────────────────────
-   MAIN
-   ──────────────────────────────────────────────────────────── */
+ 
+/**
+ * @brief Punto de entrada del programa.
+ *
+ * Inicializa el proceso, lo registra en el sistema y ejecuta el
+ * bucle principal de rondas hasta que se agota el tiempo (SIGALRM).
+ *
+ *
+ * @param argc Número de argumentos (debe ser 3).
+ * @param argv argv[1] = N_SECS, argv[2] = N_THREADS.
+ * @return 0 en éxito (en la práctica siempre sale por exit()).
+ */
 int main(int argc, char *argv[])
 {
     if (argc != 3)
@@ -539,16 +569,16 @@ int main(int argc, char *argv[])
     int n_secs = atoi(argv[1]);
     n_threads = atoi(argv[2]);
     my_pid = getpid();
+    long int solution;
+    long int target;
+    long int solution_to_write;
+    int global_round;
 
-    /*  Instalar manejadores */
-    setup_signals();
+    instalar_senales();
+    abrir_semaforos();
+    add_mi_pid();
 
-    /*  Abrir semáforos */
-    open_semaphores();
-
-    /* Registrar en pids.pid */
-    add_my_pid();
-
+    /* ── ¿Soy el primer minero? ── */
     int first_miner = 0;
     {
         sem_wait(sem_pids);
@@ -566,21 +596,48 @@ int main(int argc, char *argv[])
 
     alarm(n_secs);
 
-    /* ── PRIMER MINERO: inicializa el sistema ── */
     if (first_miner)
     {
-        write_target(0);
+        escribir_target(0);
+
+        /* Inicializar contador global de rondas a 0 */
+        sem_wait(sem_target);
+        FILE *fr = fopen(FILE_ROUND, "w");
+        if (fr)
+        {
+            fprintf(fr, "0\n");
+            fclose(fr);
+        }
+        sem_post(sem_target);
 
         sem_wait(sem_votes);
-        fclose(fopen(FILE_VOTES, "w"));
+        FILE *fv = fopen(FILE_VOTES, "w");
+        if (fv)
+            fclose(fv);
         sem_post(sem_votes);
-        /* Enviar SIGUSR1 a todos (en este momento solo estamos nosotros,
-           pero ponemos el flag para arrancarnos a nosotros mismos) */
+
+        printf("Miner %d: waiting for another miner...\n", my_pid);
+        fflush(stdout);
+        while (!flag_timeout)
+        {
+            pid_t tmp[1024];
+            int n = leer_pids(tmp, 1024);
+            if (n >= 2)
+                break;
+            sleep(1);
+        }
+        if (flag_timeout)
+        {
+            limpiar_y_salir();
+        }
+
         flag_start_round = 1;
-        /* pequeña espera para que otros mineros que arranquen casi a la vez
-           puedan registrarse antes de la primera ronda */
-        sleep(1);
-        broadcast_signal(SIGUSR1, NULL, NULL);
+        pid_t all[1024];
+        int n_all;
+        n_all = leer_pids(all, 1024);
+        for (int i = 0; i < n_all; i++)
+            if (all[i] != my_pid)
+                kill(all[i], SIGUSR1);
     }
 
     /* ────────────────────────────────────────────
@@ -589,131 +646,130 @@ int main(int argc, char *argv[])
     while (!flag_timeout)
     {
 
-        /* Esperar SIGUSR1 (inicio de ronda) */
         if (!flag_start_round)
-            wait_for_SIGUSR1();
+            esperar_signal(&flag_start_round, SIGUSR1);
         if (flag_timeout)
             break;
         flag_start_round = 0;
-        round_id++;
+        local_round++;
 
-        /* Comprobar que hay al menos 2 mineros */
         pid_t all_pids[1024];
-        int n_miners;
-        n_miners = read_pids(all_pids, 1024);
+        int n_miners = leer_pids(all_pids, 1024);
         if (n_miners < 2)
         {
-            /* Solo hay un minero: esperamos a que llegue otro */
             printf("Miner %d: only 1 miner, waiting...\n", my_pid);
             fflush(stdout);
-            wait_for_SIGUSR1();
-            if (flag_timeout)
-                break;
-            flag_start_round = 0;
-            n_miners = read_pids(all_pids, 1024);
+            continue;
         }
 
-        /* Leer objetivo */
-        long int target = read_target();
-
-        /* ── FASE DE MINADO ── */
-        long int solution = run_mining(target);
-
+        target = leer_target();
+        solution = ejecutar_minado(target);
         if (flag_timeout)
             break;
 
         /* ── SOY GANADOR ── */
         if (i_am_winner)
         {
-            /* Escribir solución en target.tgt */
-            write_target(solution);
+            /* Incrementar ronda global y decidir si falsear la solución */
+            global_round = incrementar_ronda_global();
+            solution_to_write = solution;
 
-            /* Vaciar fichero de votos */
+            if (global_round % 10 == 0)
+            {
+                solution_to_write = solution + 1;
+                printf("Miner %d: FORCING WRONG SOLUTION in round %d\n",
+                       my_pid, global_round);
+                fflush(stdout);
+            }
+
+            escribir_target(solution_to_write);
+
             sem_wait(sem_votes);
-            fclose(fopen(FILE_VOTES, "w"));
+            FILE *fv = fopen(FILE_VOTES, "w");
+            if (fv)
+                fclose(fv);
             sem_post(sem_votes);
 
-            /* Enviar SIGUSR2 a todos para arrancar votación */
-            n_miners = read_pids(all_pids, 1024); /*abre el archivo pids.pid (donde todos se apuntaron al principio) y copia todos los números de proceso (PIDs) en un array llamado all_pids*/
-                                                  /*De esa manera se hace la cuenta de cuantos mineros hay.*/
+            n_miners = leer_pids(all_pids, 1024);
             for (int i = 0; i < n_miners; i++)
                 if (all_pids[i] != my_pid)
-                    kill(all_pids[i], SIGUSR2); /*Le manda la señal a los demos de que empeiza la votacion*/
+                    kill(all_pids[i], SIGUSR2);
 
             flag_start_voting = 1;
         }
 
         /* ── FASE DE VOTACIÓN (todos) ── */
-        /*Si yo no soy el proceso ganador, el que encontró la solucion en la parte anterior me tengo que esperar hasta que marquen la señal.*/
         if (!flag_start_voting)
-            wait_for_SIGUSR2();
+            esperar_signal(&flag_start_voting, SIGUSR2);
         if (flag_timeout)
             break;
         flag_start_voting = 0;
 
-        /* Leer la solución propuesta y votar */
-        long int proposed;
-        sem_wait(sem_target);
-        FILE *ft = fopen(FILE_TARGET, "r"); /*Abrimos el archivo donde el ganador guarda la solucion */
-        if (ft)
+        /* El ganador vota con la solución REAL (siempre Y).
+           Los demás leen del fichero → N si el ganador mintió. */
+        long int proposed = leer_target();
+        if (i_am_winner)
         {
-            fscanf(ft, "%ld", &proposed); // lee la solucion
-            fclose(ft);
+            emitir_voto(solution, target); /* solución real → Y */
         }
-        sem_post(sem_target);
-
-        cast_vote(proposed, target);
+        else
+        {
+            emitir_voto(proposed, target); /* propuesta fichero */
+        }
 
         /* ── RECUENTO (solo el ganador) ── */
         if (i_am_winner)
         {
-            /* Esperar a que voten todos (con límite de intentos) */
-            int v_esperados = n_miners;
-            int intentos = 0, intentos_maximos = 50;
+            /* Releer n_miners justo antes de contar para pillar
+        si alguno salió durante la votación */
+            n_miners = leer_pids(all_pids, 1024);
+            int attempts = 0, max_attempts = 10;
             int yes = 0, no = 0, total = 0;
-            char votes_str[256] = "";
-            
+            char votes_str[512] = "";
+
             do
             {
-                usleep(100000); /* Espera 100 ms para dar tiempo a que los demás voten */
+                usleep(100000);
                 total = contar_votos(&yes, &no, votes_str, sizeof(votes_str));
-                intentos++;
-            } while (total < v_esperados && intentos < intentos_maximos);
+                attempts++;
+            } while (total < n_miners && attempts < max_attempts);
 
-            int accepted = (yes >= no);
+            int accepted = (yes > no);
             printf("Winner %d => [ %s] => %s\n",
-                   my_pid, votes_str,
-                   accepted ? "Accepted" : "Rejected");
+                   my_pid, votes_str, accepted ? "Accepted" : "Rejected");
             fflush(stdout);
 
             if (accepted)
             {
                 my_coins++;
-                log_round(round_id, target, solution, votes_str, yes, total);
+                registrar_ronda(global_round, target, solution,
+                                votes_str, yes, total);
             }
 
-            /* Preparar siguiente ronda */
-            write_target(solution); /* el nuevo target es la solución actual */
-
-            /* Restaurar sem_winner para la siguiente ronda */
+            /* El nuevo target es siempre la solución real */
+            escribir_target(solution);
             sem_post(sem_winner);
 
-            /* Enviar SIGUSR1 a todos para la siguiente ronda */
-            n_miners = read_pids(all_pids, 1024);
-            if (n_miners >= 2)
+            /* Pausa breve para que los que terminan actualicen pids */
+            usleep(50000);
+            n_miners = leer_pids(all_pids, 1024);
+            int alive = 0;
+            for (int i = 0; i < n_miners; i++)
+                if (kill(all_pids[i], 0) == 0)
+                    alive++;
+
+            if (alive >= 2)
             {
                 for (int i = 0; i < n_miners; i++)
-                    if (all_pids[i] != my_pid)
+                    if (all_pids[i] != my_pid && kill(all_pids[i], 0) == 0)
                         kill(all_pids[i], SIGUSR1);
-                flag_start_round = 1; /* me incluyo a mí mismo */
+                flag_start_round = 1;
             }
 
             i_am_winner = 0;
         }
-        /* Los no-ganadores vuelven al inicio del bucle y esperan SIGUSR1 */
     }
 
-    /* ── SALIDA ── */
-    cleanup_and_exit(my_coins);
+    limpiar_y_salir();
     return 0;
 }

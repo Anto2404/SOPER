@@ -3,31 +3,40 @@ CC = gcc
 CFLAGS = -Wall -Wextra -pedantic -std=c99 -pthread
 
 SRCS = miner.c pow.c
-OBJS = $(SRCS:.c=.o)
+OBJS = miner.o pow.o
 
 # Parámetros de prueba
-N_SECS   = 10
+N_SECS    = 30
 N_THREADS = 4
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
 
-# Lanza dos mineros como en el enunciado: uno de 5s y otro de 10s
-all: $(TARGET)
-	./$(TARGET) 5 $(N_THREADS) & ./$(TARGET) $(N_SECS) $(N_THREADS)
+miner.o: miner.c
+	$(CC) $(CFLAGS) -c miner.c
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c $<
+pow.o: pow.c
+	$(CC) $(CFLAGS) -c pow.c
 
-# Línea 22 y 23 (por si acaso, aunque parece que usas variables)
+# Caso normal: 3 mineros con tiempos distintos
+# - Minero 1: 15s → sale primero, rondas con 3 mineros [ Y Y Y ]
+# - Minero 2: 20s → sale segundo, rondas con 2 mineros [ Y Y ]
+# - Minero 3: 30s → último, limpia el sistema
+# Cada 10 rondas globales el ganador fuerza solución incorrecta → Rejected
 run: $(TARGET)
-	./$(TARGET) $(N_SECS) $(N_THREADS)
+	rm -f pids.pid target.tgt voting.vot round.rnd *.txt /dev/shm/sem.sem_*
+	./$(TARGET) 15 $(N_THREADS) & ./$(TARGET) 20 $(N_THREADS) & ./$(TARGET) $(N_SECS) $(N_THREADS) & wait
 
-# Línea 25 (Clean)
-# Asegúrate de que $(OBJS) y $(TARGET) estén bien definidos arriba
+# Caso con 5 mineros: se ve cómo van saliendo uno a uno
+# [ Y Y Y Y Y ] → [ Y Y Y Y ] → [ Y Y Y ] → [ Y Y ] → solo
+run-5miners: $(TARGET)
+	rm -f pids.pid target.tgt voting.vot round.rnd *.txt /dev/shm/sem.sem_*
+	./$(TARGET) 10 $(N_THREADS) & ./$(TARGET) 15 $(N_THREADS) & ./$(TARGET) 20 $(N_THREADS) & ./$(TARGET) 25 $(N_THREADS) & ./$(TARGET) $(N_SECS) $(N_THREADS) & wait
+
 clean:
-	rm -f $(OBJS) $(TARGET) pids.pid target.tgt voting.vot *.txt
-distclean: clean
-	rm -f *.log
+	rm -f $(OBJS) $(TARGET) pids.pid target.tgt voting.vot round.rnd *.txt
+	rm -f /dev/shm/sem.sem_*
 
-.PHONY: all clean distclean run
+distclean: clean
+
+.PHONY: run run-5miners clean distclean
